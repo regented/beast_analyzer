@@ -1,0 +1,9 @@
+starknet-py>=0.21
+httpx>=0.24
+python-dotenv
+pydantic>=1.10
+pyyaml
+cairosvg
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
