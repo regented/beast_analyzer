@@ -94,7 +94,7 @@ def build_sql(total_supply: int) -> str:
     # Use single quotes for string literal (Postgres style)
     return (
         "SELECT metadata, id "
-        f"FROM tokens WHERE contract_address = '{COLLECTION_ADDR_HEX_LOWER}' "
+        f"FROM tokens "
         f"LIMIT {int(total_supply)};"
     )
 
