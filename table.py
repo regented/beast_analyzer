@@ -2,113 +2,78 @@
 """
 Generates data.csv with per-tribe/tier counts for the Beasts collection.
 
-What it does:
-1) Reads .env for:
-   - RPC_URL
-   - COLLECTION (default provided if missing)
-   - TORII_SQL_ENDPOINT
-2) Calls collection.total_supply() on StarkNet to get total supply
-3) Queries Torii SQL for all tokens' metadata (LIMIT = total supply)
-4) Aggregates counts into data.csv with columns:
-   tribe,tier,minted,shiny,animated,special
-   - tribe: attributes[].trait_type == "Beast" → value
-   - tier:  attributes[].trait_type == "tier" → value (case-insensitive)
-   - minted: total tokens for that tribe+tier
-   - shiny: shiny==1 and animated==0
-   - animated: shiny==0 and animated==1
-   - special: shiny==1 and animated==1
+Output CSV columns (exact order):
+  tribe,tier,minted,shiny,animated,special
+
+Definitions (from metadata.attributes):
+  - tribe = value where trait_type == "Beast"
+  - tier  = value where trait_type == "Tier" (note capital T)
+  - shiny count    = Shiny == "1" and Animated == "0"
+  - animated count = Shiny == "0" and Animated == "1"
+  - special count  = Shiny == "1" and Animated == "1"
+  - minted = total tokens aggregated for that (tribe, tier)
+
+Environment:
+  - TORII_SQL_ENDPOINT (default: https://api.cartridge.gg/x/pg-beasts/torii/sql)
+  - BATCH_SIZE (optional; default: 5000)
+
+The script queries the tokens table via Torii SQL in pages:
+  SELECT metadata FROM tokens ORDER BY token_id LIMIT {BATCH} OFFSET {OFFSET}
+
+We do not use chain RPC or contract address; the entire set is fetched from the tokens table.
 """
 
 import os
 import csv
 import json
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
 
-from starknet_py.net.full_node_client import FullNodeClient
-from starknet_py.net.client_models import Call
-from starknet_py.hash.selector import get_selector_from_name
-
-# ---------------- Env & Constants ----------------
+# ---------------- Env & constants ----------------
 
 load_dotenv()
 
-RPC_URL = os.getenv("RPC_URL", "").strip()
-COLLECTION_ADDR = (os.getenv("COLLECTION", "") or "0x046dA8955829ADF2bDa310099A0063451923f02E648cF25A1203aac6335CF0e4").strip()
-TORII_SQL_ENDPOINT = os.getenv("TORII_SQL_ENDPOINT", "https://api.cartridge.gg/x/pg-beasts/torii/sql").strip()
+TORII_SQL_ENDPOINT = os.getenv(
+    "TORII_SQL_ENDPOINT",
+    "https://api.cartridge.gg/x/pg-beasts/torii/sql",
+).strip()
 
-if not RPC_URL:
-    raise SystemExit("RPC_URL is required in .env")
-if not COLLECTION_ADDR:
-    raise SystemExit("COLLECTION (contract address) is required in .env")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5000"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60"))  # seconds
+RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "1.5"))     # seconds
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 
-# Normalize address styles
-COLLECTION_ADDR_INT = int(COLLECTION_ADDR, 16)
-COLLECTION_ADDR_HEX_LOWER = "0x" + format(COLLECTION_ADDR_INT, "x")  # lowercase 0x…
+OUT_CSV = "data.csv"
 
+# ---------------- SQL helpers ----------------
 
-# ---------------- StarkNet helpers ----------------
+def build_paged_sql(limit: int, offset: int) -> str:
+    # Only fetch 'metadata' (TEXT JSON) to keep payload smaller
+    # We order by token_id for deterministic pagination.
+    return f"""
+        SELECT metadata
+        FROM tokens
+        WHERE contract_address = '0x046da8955829adf2bda310099a0063451923f02e648cf25a1203aac6335cf0e4'
+        ORDER BY token_id
+        LIMIT {int(limit)}
+        OFFSET {int(offset)};
+    """.strip()
 
-def u256_join(low: int, high: int) -> int:
-    return (high << 128) + low
-
-async def call_view(
-    client: FullNodeClient,
-    addr_hex: str,
-    selector: int,
-    calldata: List[int] | Tuple[int, ...] = (),
-) -> List[int]:
-    call = Call(to_addr=int(addr_hex, 16), selector=selector, calldata=list(calldata))
-    return await client.call_contract(call)
-
-async def get_total_supply(client: FullNodeClient, collection_hex: str) -> int:
+def parse_torii_payload(payload: Any) -> List[Dict[str, Any]]:
     """
-    Tries common selectors: total_supply (snake) then totalSupply (camel).
-    Supports return types: felt or (low, high) u256.
-    """
-    selectors = [
-        get_selector_from_name("total_supply"),
-        get_selector_from_name("totalSupply"),
-    ]
-    last_err: Optional[Exception] = None
-    for sel in selectors:
-        try:
-            res = await call_view(client, collection_hex, sel, [])
-            if not res:
-                continue
-            if len(res) == 1:
-                return int(res[0])
-            if len(res) >= 2:
-                return int(u256_join(int(res[0]), int(res[1])))
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"Failed to call total supply on {collection_hex}: {last_err}")
-
-
-# ---------------- Torii SQL helpers ----------------
-
-def build_sql(total_supply: int) -> str:
-    # Use single quotes for string literal (Postgres style)
-    return (
-        "SELECT metadata, id "
-        f"FROM tokens "
-        f"LIMIT {int(total_supply)};"
-    )
-
-def parse_torii_rows(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Accepts either:
+    Normalize Torii SQL results to a list of dict rows with key 'metadata'.
+    Supports:
       - { "columns": [...], "rows": [[...], ...] }
       - { "rows": [ {col:val, ...}, ... ] }
-      - [ { "metadata": ..., "id": ... }, ... ]
-    Returns a list of dict rows.
+      - [ { "metadata": ... }, ... ]
     """
     rows_out: List[Dict[str, Any]] = []
 
     if isinstance(payload, dict):
+        # Variant: columns + rows (matrix)
         if "rows" in payload and "columns" in payload and isinstance(payload["rows"], list):
             cols = [str(c) for c in payload.get("columns", [])]
             for r in payload["rows"]:
@@ -116,62 +81,126 @@ def parse_torii_rows(payload: Any) -> List[Dict[str, Any]]:
                     row = {cols[i]: r[i] for i in range(min(len(cols), len(r)))}
                     rows_out.append(row)
             return rows_out
+        # Variant: rows as list of dicts
         if "rows" in payload and isinstance(payload["rows"], list):
             for r in payload["rows"]:
                 if isinstance(r, dict):
                     rows_out.append(r)
             return rows_out
-        if "metadata" in payload or "id" in payload:
-            rows_out.append(payload)
+        # Single row dict
+        if "metadata" in payload:
+            rows_out.append({"metadata": payload.get("metadata")})
             return rows_out
 
+    # Variant: list of dicts
     if isinstance(payload, list):
         for item in payload:
             if isinstance(item, dict):
-                rows_out.append(item)
+                # Keep only metadata key if present
+                if "metadata" in item:
+                    rows_out.append({"metadata": item["metadata"]})
+                else:
+                    rows_out.append(item)
+
     return rows_out
 
-async def torii_query_all(sql: str) -> List[Dict[str, Any]]:
+def torii_query(sql: str) -> List[Dict[str, Any]]:
     """
-    GET with ?query=... first, fallback to POST text/plain.
+    Execute a SQL query against Torii. Try GET first (with ?query), then POST text/plain.
+    Includes basic retry for transient failures.
     """
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(TORII_SQL_ENDPOINT, params={"query": sql})
-        if r.status_code >= 300:
-            r = await client.post(TORII_SQL_ENDPOINT, content=sql, headers={"Content-Type": "text/plain"})
-        r.raise_for_status()
-        data = r.json()
-    return parse_torii_rows(data)
+    last_err: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+                # Try GET
+                r = client.get(TORII_SQL_ENDPOINT, params={"query": sql})
+                if r.status_code >= 300:
+                    # Fallback POST
+                    r = client.post(
+                        TORII_SQL_ENDPOINT,
+                        content=sql,
+                        headers={"Content-Type": "text/plain"},
+                    )
+                r.raise_for_status()
+                data = r.json()
+                return parse_torii_payload(data)
+        except Exception as e:
+            last_err = e
+            if attempt == MAX_RETRIES:
+                break
+            sleep_s = RETRY_BACKOFF ** attempt
+            print(f"[warn] Torii query failed (attempt {attempt}/{MAX_RETRIES}): {e}. Retrying in {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
+    raise RuntimeError(f"Torii SQL request failed after {MAX_RETRIES} attempts: {last_err}")
 
-
-# ---------------- Metadata parsing & aggregation ----------------
-
-def get_attr_value(attrs: Any, trait_name: str) -> Optional[str]:
+def fetch_all_metadata(batch_size: int = BATCH_SIZE) -> List[Dict[str, Any]]:
     """
-    Finds attributes[].trait_type == trait_name (case-insensitive) and returns its value as string.
-    Supports attributes being a list of objects or a dict mapping.
+    Paginates through the tokens table and returns a list of dicts: { "metadata": <json-or-str> }.
     """
-    if isinstance(attrs, list):
-        for a in attrs:
-            if isinstance(a, dict):
-                t = str(a.get("trait_type", "")).strip()
-                if t.lower() == trait_name.lower():
-                    return None if a.get("value") is None else str(a.get("value"))
-    elif isinstance(attrs, dict):
-        for k, v in attrs.items():
-            if str(k).lower() == trait_name.lower():
-                return None if v is None else str(v)
+    results: List[Dict[str, Any]] = []
+    offset = 0
+    total_rows = 0
+    while True:
+        sql = build_paged_sql(limit=batch_size, offset=offset)
+        rows = torii_query(sql)
+        if not rows:
+            break
+        results.extend(rows)
+        fetched = len(rows)
+        total_rows += fetched
+        print(f"Fetched {fetched} rows (total {total_rows})...")
+        if fetched < batch_size:
+            # last page
+            break
+        offset += batch_size
+    return results
+
+# ---------------- Metadata parsing ----------------
+
+def to_str_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+def attr_lookup(attributes: Any, trait_type_exact: str) -> Optional[str]:
+    """
+    Returns value (as string) for the first attribute where trait_type equals trait_type_exact.
+    Only matches exact case (e.g., "Tier" not "tier") per requirement.
+    Accepts attributes as a list of objects (OpenSea-like format).
+    """
+    if isinstance(attributes, list):
+        for a in attributes:
+            if not isinstance(a, dict):
+                continue
+            ttype = to_str_or_none(a.get("trait_type"))
+            if ttype == trait_type_exact:
+                return to_str_or_none(a.get("value"))
+    # Some collections store attributes as dicts; keep strict to requirement,
+    # but if dict-like and exact key exists, use it.
+    if isinstance(attributes, dict) and trait_type_exact in attributes:
+        return to_str_or_none(attributes.get(trait_type_exact))
     return None
 
-def parse_metadata(meta_raw: Any) -> Dict[str, Any]:
+def parse_token_metadata(meta_raw: Any) -> Tuple[str, str, int, int]:
     """
-    Normalizes metadata into a dict and extracts:
+    Parses a single row's metadata into:
       - tribe (Beast)
-      - tier (trait_type "tier")
-      - shiny (int 0/1)
-      - animated (int 0/1)
+      - tier  (Tier)
+      - shiny flag (0/1)
+      - animated flag (0/1)
+    Missing fields default to "Unknown" for tribe/tier and 0 for flags.
     """
+    tribe = "Unknown"
+    tier = "Unknown"
+    shiny = 0
+    animated = 0
+
     meta: Optional[Dict[str, Any]] = None
+
     if isinstance(meta_raw, dict):
         meta = meta_raw
     elif isinstance(meta_raw, str):
@@ -180,44 +209,37 @@ def parse_metadata(meta_raw: Any) -> Dict[str, Any]:
         except Exception:
             meta = None
 
-    tribe = "Unknown"
-    tier = "Unknown"
-    shiny_i = 0
-    animated_i = 0
+    if meta and isinstance(meta, dict):
+        attributes = meta.get("attributes")
+        # Required exact-case fields per spec
+        tribe_val = attr_lookup(attributes, "Beast")
+        tier_val = attr_lookup(attributes, "Tier")
+        shiny_val = attr_lookup(attributes, "Shiny")
+        animated_val = attr_lookup(attributes, "Animated")
 
-    if meta:
-        attrs = meta.get("attributes")
-        tribe_val = get_attr_value(attrs, "Beast")
         if tribe_val:
-            tribe = str(tribe_val)
-
-        tier_val = get_attr_value(attrs, "tier")
+            tribe = tribe_val
         if tier_val:
-            tier = str(tier_val)
+            tier = tier_val
 
-        shiny_val = get_attr_value(attrs, "Shiny")
-        animated_val = get_attr_value(attrs, "Animated")
-
-        def to_int01(v: Optional[str]) -> int:
-            if v is None:
+        def to01(s: Optional[str]) -> int:
+            if s is None:
                 return 0
-            s = str(v).strip().lower()
-            if s in ("1", "true", "yes"):
-                return 1
-            if s in ("0", "false", "no"):
-                return 0
-            try:
-                return 1 if int(float(s)) != 0 else 0
-            except Exception:
-                return 0
+            ss = s.strip()
+            # Only "1" is true per requirement
+            return 1 if ss == "1" else 0
 
-        shiny_i = to_int01(shiny_val)
-        animated_i = to_int01(animated_val)
+        shiny = to01(shiny_val)
+        animated = to01(animated_val)
 
-    return {"tribe": tribe, "tier": tier, "shiny": shiny_i, "animated": animated_i}
+    return tribe, tier, shiny, animated
 
-def aggregate_counts(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, int]]:
+# ---------------- Aggregation ----------------
+
+def aggregate(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, int]]:
     """
+    Aggregates counts per (tribe, tier).
+
     Returns:
       { (tribe, tier): { minted, shiny, animated, special } }
     """
@@ -225,11 +247,7 @@ def aggregate_counts(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[s
 
     for row in rows:
         meta_raw = row.get("metadata")
-        parsed = parse_metadata(meta_raw)
-        tribe = parsed["tribe"]
-        tier = parsed["tier"]
-        shiny = int(parsed["shiny"])
-        animated = int(parsed["animated"])
+        tribe, tier, shiny, animated = parse_token_metadata(meta_raw)
 
         key = (tribe, tier)
         if key not in agg:
@@ -242,37 +260,21 @@ def aggregate_counts(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[s
             agg[key]["animated"] += 1
         elif shiny == 1 and animated == 1:
             agg[key]["special"] += 1
+        # If both 0 → regular; not counted in trait columns.
 
     return agg
 
+# ---------------- CSV writing ----------------
 
-# ---------------- Main ----------------
-
-async def main():
-    # 1) Get total supply from chain
-    client = FullNodeClient(node_url=RPC_URL)
-    total_supply = await get_total_supply(client, COLLECTION_ADDR)
-    print(f"Total supply reported on-chain: {total_supply}")
-
-    # 2) Query Torii SQL for all tokens' metadata (LIMIT total_supply)
-    sql = build_sql(total_supply)
-    rows = await torii_query_all(sql)
-    print(f"Fetched {len(rows)} rows from Torii.")
-
-    if not rows:
-        print("No rows returned. Exiting.")
-        return
-
-    # 3) Aggregate and write CSV
-    agg = aggregate_counts(rows)
-    out_path = "data.csv"
+def write_csv(agg: Dict[Tuple[str, str], Dict[str, int]], out_path: str = OUT_CSV) -> str:
+    # Deterministic ordering: tribe (case-insensitive), then tier (string)
+    sorted_keys = sorted(agg.keys(), key=lambda x: (str(x[0]).lower(), str(x[1]).lower()))
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["tribe", "tier", "minted", "shiny", "animated", "special"])
-        # Sort by tribe then tier for deterministic output
-        for (tribe, tier) in sorted(agg.keys(), key=lambda x: (x[0].lower(), str(x[1]).lower())):
+        w = csv.writer(f)
+        w.writerow(["tribe", "tier", "minted", "shiny", "animated", "special"])
+        for (tribe, tier) in sorted_keys:
             stats = agg[(tribe, tier)]
-            writer.writerow([
+            w.writerow([
                 tribe,
                 tier,
                 stats["minted"],
@@ -280,9 +282,34 @@ async def main():
                 stats["animated"],
                 stats["special"],
             ])
+    return out_path
 
-    print(f"Wrote {out_path} with {len(agg)} tribe/tier rows.")
+# ---------------- Main ----------------
+
+def main():
+    if not TORII_SQL_ENDPOINT:
+        raise SystemExit("TORII_SQL_ENDPOINT is required (set in .env or environment).")
+
+    print(f"Using Torii SQL endpoint: {TORII_SQL_ENDPOINT}")
+    print(f"Batch size: {BATCH_SIZE}")
+
+    rows = fetch_all_metadata(batch_size=BATCH_SIZE)
+    total = len(rows)
+    if total == 0:
+        print("No rows returned from tokens table. Exiting without writing CSV.")
+        return
+
+    agg = aggregate(rows)
+    out_path = write_csv(agg, OUT_CSV)
+
+    distinct_pairs = len(agg)
+    minted_total = sum(v["minted"] for v in agg.values())
+    shiny_total = sum(v["shiny"] for v in agg.values())
+    animated_total = sum(v["animated"] for v in agg.values())
+    special_total = sum(v["special"] for v in agg.values())
+
+    print(f"Wrote {out_path} with {distinct_pairs} tribe/tier rows.")
+    print(f"Totals across all rows fetched: minted={minted_total}, shiny={shiny_total}, animated={animated_total}, special={special_total}")
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
